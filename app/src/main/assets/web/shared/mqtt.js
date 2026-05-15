@@ -180,6 +180,7 @@ const MQTT = {
         document.getElementById('formAdaptive').checked = true;
         document.getElementById('formRetain').checked = false;
         document.getElementById('formEnabled').checked = true;
+        document.getElementById('formHaDiscovery').checked = false;
         document.getElementById('formCard').style.display = 'block';
         document.getElementById('formName').focus();
     },
@@ -203,6 +204,7 @@ const MQTT = {
         document.getElementById('formAdaptive').checked = conn.adaptiveInterval !== false;
         document.getElementById('formRetain').checked = conn.retainMessages || false;
         document.getElementById('formEnabled').checked = conn.enabled || false;
+        document.getElementById('formHaDiscovery').checked = conn.homeAssistantDiscovery || false;
         document.getElementById('formCard').style.display = 'block';
         document.getElementById('formName').focus();
     },
@@ -225,7 +227,8 @@ const MQTT = {
             publishIntervalSeconds: parseInt(document.getElementById('formInterval').value) || 5,
             adaptiveInterval: document.getElementById('formAdaptive').checked,
             retainMessages: document.getElementById('formRetain').checked,
-            enabled: document.getElementById('formEnabled').checked
+            enabled: document.getElementById('formEnabled').checked,
+            homeAssistantDiscovery: document.getElementById('formHaDiscovery').checked
         };
 
         if (!data.name) { this.toast('Connection name is required', 'error'); return; }

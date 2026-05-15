@@ -29,6 +29,7 @@ public class MqttConnectionConfig {
     public boolean adaptiveInterval;     // If true, slow down when parked (like ABRP)
     public boolean retainMessages;       // MQTT retain flag on published messages
     public boolean trustAllCerts;        // If true, accept self-signed/untrusted certs (Home Assistant)
+    public boolean homeAssistantDiscovery; // If true, publish HA MQTT auto-discovery configs and subscribe to command topics
 
     // Defaults
     private static final int DEFAULT_PORT = 1883;
@@ -37,6 +38,7 @@ public class MqttConnectionConfig {
     private static final boolean DEFAULT_ADAPTIVE = true;
     private static final boolean DEFAULT_RETAIN = false;
     private static final boolean DEFAULT_TRUST_ALL_CERTS = false;
+    private static final boolean DEFAULT_HA_DISCOVERY = false;
 
     /**
      * Create a new connection config with defaults.
@@ -56,6 +58,7 @@ public class MqttConnectionConfig {
         this.adaptiveInterval = DEFAULT_ADAPTIVE;
         this.retainMessages = DEFAULT_RETAIN;
         this.trustAllCerts = DEFAULT_TRUST_ALL_CERTS;
+        this.homeAssistantDiscovery = DEFAULT_HA_DISCOVERY;
     }
 
     /**
@@ -154,6 +157,7 @@ public class MqttConnectionConfig {
             json.put("adaptiveInterval", adaptiveInterval);
             json.put("retainMessages", retainMessages);
             json.put("trustAllCerts", trustAllCerts);
+            json.put("homeAssistantDiscovery", homeAssistantDiscovery);
         } catch (Exception ignored) {}
         return json;
     }
@@ -189,6 +193,7 @@ public class MqttConnectionConfig {
         config.adaptiveInterval = json.optBoolean("adaptiveInterval", DEFAULT_ADAPTIVE);
         config.retainMessages = json.optBoolean("retainMessages", DEFAULT_RETAIN);
         config.trustAllCerts = json.optBoolean("trustAllCerts", DEFAULT_TRUST_ALL_CERTS);
+        config.homeAssistantDiscovery = json.optBoolean("homeAssistantDiscovery", DEFAULT_HA_DISCOVERY);
         return config;
     }
 

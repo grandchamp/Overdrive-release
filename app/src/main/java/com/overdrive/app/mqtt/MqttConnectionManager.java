@@ -546,6 +546,41 @@ public class MqttConnectionManager {
                 // Per-tyre temperature is not available via the public
                 // BYD SDK on real firmwares — keys removed to avoid
                 // publishing stale/zero values.
+
+                // ==================== CONTROL STATE ====================
+                // Window open percent (0=closed, 100=open, UNAVAILABLE=-1)
+                // windowOpenPercent is indexed 0-based: [LF, RF, LR, RR, sunroof, sunshade]
+                if (vd.windowOpenPercent != null) {
+                    int[] w = vd.windowOpenPercent;
+                    if (w.length > 0 && w[0] != BydVehicleData.UNAVAILABLE) payload.put("window_lf_pct", w[0]);
+                    if (w.length > 1 && w[1] != BydVehicleData.UNAVAILABLE) payload.put("window_rf_pct", w[1]);
+                    if (w.length > 2 && w[2] != BydVehicleData.UNAVAILABLE) payload.put("window_lr_pct", w[2]);
+                    if (w.length > 3 && w[3] != BydVehicleData.UNAVAILABLE) payload.put("window_rr_pct", w[3]);
+                    if (w.length > 4 && w[4] != BydVehicleData.UNAVAILABLE) payload.put("sunroof_pct", w[4]);
+                    if (w.length > 5 && w[5] != BydVehicleData.UNAVAILABLE) payload.put("sunshade_pct", w[5]);
+                }
+
+                // Sunroof/sunshade from dedicated fields when window array doesn't cover them
+                if (!payload.has("sunroof_pct") && vd.sunroofPosition != BydVehicleData.UNAVAILABLE)
+                    payload.put("sunroof_pct", vd.sunroofPosition);
+                if (!payload.has("sunshade_pct") && vd.sunshadePercent != BydVehicleData.UNAVAILABLE)
+                    payload.put("sunshade_pct", vd.sunshadePercent);
+
+                // Trunk open state: doorLockStatus[4] uses lock-state enum (1=locked,2=unlocked,−1=unknown)
+                // We publish as a boolean: true = unlocked/open, false = locked/closed
+                if (vd.doorLockStatus != null && vd.doorLockStatus.length >= 5
+                        && vd.doorLockStatus[4] != BydVehicleData.UNAVAILABLE) {
+                    payload.put("trunk_open", vd.doorLockStatus[4] == 2);
+                }
+
+                // AC state
+                boolean vehiclePoweredOnForAc = vd.powerLevel != BydVehicleData.UNAVAILABLE && vd.powerLevel >= 2;
+                if (vd.acStartState != BydVehicleData.UNAVAILABLE) {
+                    payload.put("ac_on", vehiclePoweredOnForAc && vd.acStartState == 1);
+                }
+                if (vd.acFanLevel != BydVehicleData.UNAVAILABLE && vehiclePoweredOnForAc) {
+                    payload.put("ac_fan", vd.acFanLevel);
+                }
             }
 
         } catch (Exception e) {

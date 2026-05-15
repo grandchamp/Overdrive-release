@@ -2,13 +2,12 @@ package com.overdrive.app.mqtt;
 
 import com.overdrive.app.logging.DaemonLogger;
 
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.MqttCallback;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
-import org.eclipse.paho.client.mqttv3.MqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.json.JSONObject;
 
@@ -49,10 +48,14 @@ public class MqttPublisherService implements MqttCallback {
     private volatile int consecutiveFailures = 0;
     private volatile String lastError = null;
 
+    // HA integration (null when homeAssistantDiscovery is disabled)
+    private final HaIntegration ha;
+
     public MqttPublisherService(MqttConnectionConfig config, String deviceId) {
         this.config = config;
         this.deviceId = deviceId;
         this.logger = DaemonLogger.getInstance(TAG + "-" + config.id);
+        this.ha = config.homeAssistantDiscovery ? new HaIntegration(config, deviceId) : null;
     }
 
     // ==================== LIFECYCLE ====================
@@ -181,6 +184,9 @@ public class MqttPublisherService implements MqttCallback {
             }
 
             logger.info("Connected to " + brokerUri);
+
+            if (ha != null) ha.onConnected(client);
+
             return true;
 
         } catch (MqttException e) {
@@ -229,6 +235,8 @@ public class MqttPublisherService implements MqttCallback {
         if (client != null) {
             try {
                 if (client.isConnected()) {
+                    if (ha != null) ha.onDisconnected(client);
+
                     // Publish graceful "offline" before disconnect.
                     // The LWT only fires on ungraceful drops — this covers clean shutdowns.
                     try {
@@ -311,7 +319,7 @@ public class MqttPublisherService implements MqttCallback {
 
     @Override
     public void messageArrived(String topic, MqttMessage message) {
-        // We don't subscribe to anything — publish only
+        if (ha != null) ha.onMessage(topic, new String(message.getPayload()).trim());
     }
 
     @Override
