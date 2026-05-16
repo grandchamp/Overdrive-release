@@ -183,6 +183,7 @@ public class MqttConnectionStore {
             if (updates.has("adaptiveInterval")) existing.adaptiveInterval = updates.optBoolean("adaptiveInterval");
             if (updates.has("retainMessages")) existing.retainMessages = updates.optBoolean("retainMessages");
             if (updates.has("trustAllCerts")) existing.trustAllCerts = updates.optBoolean("trustAllCerts");
+            if (updates.has("homeAssistantDiscovery")) existing.homeAssistantDiscovery = updates.optBoolean("homeAssistantDiscovery");
 
             save();
             logger.info("Updated MQTT connection: " + existing);
