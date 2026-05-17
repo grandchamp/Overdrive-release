@@ -173,6 +173,23 @@ public class MqttConnectionManager {
 
         MqttPublisherService publisher = new MqttPublisherService(config, deviceId);
 
+        // When a HA command runs, schedule a burst of follow-up publishes so HA's
+        // UI tracks the motion to completion. A single immediate publish only
+        // catches the start of motion — covers/windows take 3-8s to reach target,
+        // and the next regular tick may be 30s+ away (parked + adaptive interval).
+        final String cfgId = config.id;
+        publisher.setOnHaCommandExecuted(() -> {
+            ScheduledExecutorService scheduler = schedulers.get(cfgId);
+            if (scheduler == null || scheduler.isShutdown()) return;
+            int[] delaysMs = {500, 2000, 5000, 10000, 15000};
+            for (int delay : delaysMs) {
+                try {
+                    scheduler.schedule(() -> publishImmediate(cfgId),
+                            delay, TimeUnit.MILLISECONDS);
+                } catch (Exception ignored) {}
+            }
+        });
+
         // Attempt initial connection (non-blocking — will retry on first publish if fails)
         boolean connected = publisher.connect();
         logger.info("Connection " + config.name + " (" + config.id + "): "
@@ -216,6 +233,21 @@ public class MqttConnectionManager {
         ScheduledFuture<?> task = scheduler.schedule(() -> runPublishCycle(connectionId),
                 delaySeconds, TimeUnit.SECONDS);
         scheduledTasks.put(connectionId, task);
+    }
+
+    /**
+     * Collect telemetry and publish immediately, without rescheduling the
+     * regular cycle. Used to track motion-completion after HA commands.
+     */
+    private void publishImmediate(String connectionId) {
+        MqttPublisherService publisher = publishers.get(connectionId);
+        if (publisher == null || !publisher.isRunning()) return;
+        try {
+            JSONObject payload = collectTelemetry();
+            publisher.publish(payload);
+        } catch (Exception e) {
+            logger.warn("Immediate publish failed for " + connectionId + ": " + e.getMessage());
+        }
     }
 
     /**
@@ -581,6 +613,10 @@ public class MqttConnectionManager {
                 if (vd.acFanLevel != BydVehicleData.UNAVAILABLE && vehiclePoweredOnForAc) {
                     payload.put("ac_fan", vd.acFanLevel);
                 }
+
+                // Lights / ADAS state
+                payload.put("drl_on", vd.dayTimeLight);
+                payload.put("slw_on", vd.speedLimitWarning);
             }
 
         } catch (Exception e) {

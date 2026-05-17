@@ -55,6 +55,14 @@ Heat and ventilation, driver + passenger.
 
 Any unrecognised payload maps to `OFF` (level 0).
 
+### Seat memory recall
+
+Driver-side seat memory positions stored in the car. Each command recalls a position.
+
+| Topic suffix | Payload | Notes |
+|---|---|---|
+| `seat/memory` | `1` / `2` | Stored driver-side positions |
+
 ---
 
 ## Charging
@@ -62,6 +70,22 @@ Any unrecognised payload maps to `OFF` (level 0).
 | Topic suffix | Payload | Notes |
 |---|---|---|
 | `charge/stop` | `50`–`100` | Stop-charge percentage. HA picker uses step 5 |
+
+---
+
+## Lights
+
+| Topic suffix | Payload | Notes |
+|---|---|---|
+| `lights/drl` | `ON` / `OFF` | Daytime Running Lights. State is read back in telemetry as `drl_on` |
+
+---
+
+## ADAS
+
+| Topic suffix | Payload | Notes |
+|---|---|---|
+| `adas/slw` | `ON` / `OFF` | Speed Limit Warning. State is read back in telemetry as `slw_on` |
 
 ---
 

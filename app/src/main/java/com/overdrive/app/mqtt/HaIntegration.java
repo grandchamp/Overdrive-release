@@ -43,12 +43,22 @@ class HaIntegration {
     private final Map<String, CommandHandler> commandMap;
     private volatile boolean discoveryPublished = false;
     private final List<String> discoveryTopics = Collections.synchronizedList(new ArrayList<>());
+    private volatile Runnable onCommandExecuted;
 
     HaIntegration(MqttConnectionConfig config, String deviceId) {
         this.config = config;
         this.deviceId = deviceId;
         this.logger = DaemonLogger.getInstance(TAG);
         this.commandMap = buildCommandMap();
+    }
+
+    /**
+     * Set a callback to fire after each successful command. Used to trigger
+     * an immediate telemetry publish so HA's UI updates without waiting for
+     * the next scheduled publish interval.
+     */
+    void setOnCommandExecuted(Runnable r) {
+        this.onCommandExecuted = r;
     }
 
     // ==================== LIFECYCLE ====================
@@ -171,6 +181,16 @@ class HaIntegration {
         pub(client, "select", uid + "_seat_vent_driver", haSelect(dev, "Seat Vent Driver",    cmd + "seat/driver/vent", levels));
         pub(client, "select", uid + "_seat_vent_pass",   haSelect(dev, "Seat Vent Passenger", cmd + "seat/pass/vent",   levels));
 
+        // Seat memory recall — buttons (each press recalls a stored driver-side position)
+        pub(client, "button", uid + "_seat_mem_1", haButtonWithPayload(dev, "Recall Seat Position 1", cmd + "seat/memory", "1"));
+        pub(client, "button", uid + "_seat_mem_2", haButtonWithPayload(dev, "Recall Seat Position 2", cmd + "seat/memory", "2"));
+
+        // Lights: DRL (stateful — read back from HAL)
+        pub(client, "switch", uid + "_drl", haStatefulSwitch(dev, "Daytime Running Lights", state, "drl_on", avail, cmd + "lights/drl"));
+
+        // ADAS: speed limit warning (stateful — read back from HAL)
+        pub(client, "switch", uid + "_slw", haStatefulSwitch(dev, "Speed Limit Warning", state, "slw_on", avail, cmd + "adas/slw"));
+
         // Charge stop (optimistic)
         pub(client, "number", uid + "_charge_stop", haNumber(dev, "Charge Stop", null, null, null, cmd + "charge/stop", 50, 100, 5, true));
 
@@ -281,6 +301,18 @@ class HaIntegration {
         map.put("ambient/color", payload ->
             BydDataCollector.getInstance().setAmbientColor(Integer.parseInt(payload.trim())));
 
+        // Seat memory recall — payload is "1" or "2" (driver-side stored positions)
+        map.put("seat/memory", payload ->
+            BydDataCollector.getInstance().setSeatMemoryPosition(Integer.parseInt(payload.trim())));
+
+        // Lights: daytime running lights
+        map.put("lights/drl", payload ->
+            BydDataCollector.getInstance().setDayTimeLight("ON".equalsIgnoreCase(payload.trim())));
+
+        // ADAS: speed limit warning
+        map.put("adas/slw", payload ->
+            BydDataCollector.getInstance().setSpeedLimitWarning("ON".equalsIgnoreCase(payload.trim())));
+
         // Cloud: lock/unlock (single topic, payload distinguishes action) and flash
         map.put("lock", payload -> {
             BydCloudClient cloudClient = getCloudClient();
@@ -302,6 +334,15 @@ class HaIntegration {
         try {
             handler.execute(payload);
             logger.info("HA: command executed (" + suffix + " ← " + payload + ")");
+
+            // Notify the manager so it can schedule a burst of publishes to track
+            // motion completing (windows/covers take 3-8s to reach target).
+            Runnable cb = onCommandExecuted;
+            if (cb != null) {
+                try { cb.run(); } catch (Exception e) {
+                    logger.warn("HA: onCommandExecuted callback failed: " + e.getMessage());
+                }
+            }
         } catch (Exception e) {
             logger.warn("HA: command error (" + suffix + " ← " + payload + "): " + e.getMessage());
         }
@@ -454,6 +495,25 @@ class HaIntegration {
         return cfg;
     }
 
+    /** Switch with real state read-back from a boolean field in the state JSON. */
+    private JSONObject haStatefulSwitch(JSONObject dev, String name, String stateTopic,
+                                          String field, String availTopic, String cmdTopic) {
+        JSONObject cfg = new JSONObject();
+        try {
+            cfg.put("name", name);
+            cfg.put("state_topic", stateTopic);
+            cfg.put("value_template", "{{ 'ON' if value_json." + field + " else 'OFF' }}");
+            cfg.put("command_topic", cmdTopic);
+            cfg.put("payload_on", "ON");
+            cfg.put("payload_off", "OFF");
+            cfg.put("state_on", "ON");
+            cfg.put("state_off", "OFF");
+            cfg.put("availability_topic", availTopic);
+            cfg.put("device", dev);
+        } catch (Exception ignored) {}
+        return cfg;
+    }
+
     private JSONObject haNumber(JSONObject dev, String name, String stateTopic, String field,
                                  String availTopic, String cmdTopic, int min, int max, int step,
                                  boolean optimistic) {
@@ -508,6 +568,18 @@ class HaIntegration {
             cfg.put("name", name);
             cfg.put("command_topic", cmdTopic);
             cfg.put("payload_press", "PRESS");
+            cfg.put("device", dev);
+        } catch (Exception ignored) {}
+        return cfg;
+    }
+
+    /** Button that publishes a specific payload on press (instead of the default PRESS). */
+    private JSONObject haButtonWithPayload(JSONObject dev, String name, String cmdTopic, String payload) {
+        JSONObject cfg = new JSONObject();
+        try {
+            cfg.put("name", name);
+            cfg.put("command_topic", cmdTopic);
+            cfg.put("payload_press", payload);
             cfg.put("device", dev);
         } catch (Exception ignored) {}
         return cfg;

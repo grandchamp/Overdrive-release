@@ -316,16 +316,21 @@ public class MqttPublisherService implements MqttCallback {
         logger.warn(lastError);
         ProxyHelper.invalidateCache();
 
-        // Trigger immediate reconnect in a background thread so HA doesn't see
-        // entities as unavailable for the full publish-interval + backoff window.
-        // Without this, the publisher waits idly until the next scheduled publish()
-        // before noticing it's dead and trying to reconnect.
+        // Retry-with-backoff so HA doesn't see entities as unavailable for the full
+        // publish-interval + backoff window. If the broker is briefly unreachable
+        // (network blip, NAT cycle, broker restart), this loop catches it within seconds.
+        // The publish scheduler's own backoff takes over if all attempts here fail.
         if (running) {
             new Thread(() -> {
-                try {
-                    Thread.sleep(1000);  // brief pause to let the broker settle
-                    connect();
-                } catch (InterruptedException ignored) {}
+                int[] backoffMs = {1000, 2000, 4000, 8000, 16000};
+                for (int delay : backoffMs) {
+                    try { Thread.sleep(delay); } catch (InterruptedException e) { return; }
+                    if (!running) return;
+                    if (connected && client != null && client.isConnected()) return;
+                    logger.info("Reconnect attempt after " + delay + "ms");
+                    if (connect()) return;
+                }
+                logger.warn("Reconnect loop exhausted — leaving to publish scheduler");
             }, "MQTT-Reconnect-" + config.id).start();
         }
     }
@@ -338,6 +343,15 @@ public class MqttPublisherService implements MqttCallback {
     @Override
     public void deliveryComplete(IMqttDeliveryToken token) {
         // Delivery confirmed (QoS 1)
+    }
+
+    /**
+     * Register a callback to fire after each successful HA command. The manager
+     * wires this to trigger an immediate publish so HA's UI updates without
+     * waiting for the next scheduled publish interval.
+     */
+    public void setOnHaCommandExecuted(Runnable r) {
+        if (ha != null) ha.setOnCommandExecuted(r);
     }
 
     // ==================== STATUS ====================
