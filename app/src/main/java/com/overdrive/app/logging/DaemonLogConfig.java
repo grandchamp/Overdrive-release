@@ -172,13 +172,16 @@ public final class DaemonLogConfig {
     // ==================== MQTT ====================
 
     /** MqttConnectionManager - MQTT connection orchestration */
-    public static final boolean MQTT_CONNECTION_MANAGER = false;
+    public static final boolean MQTT_CONNECTION_MANAGER = true;
 
     /** MqttPublisher - per-connection MQTT publishing */
-    public static final boolean MQTT_PUBLISHER = false;
+    public static final boolean MQTT_PUBLISHER = true;
 
     /** MqttConnectionStore - MQTT config persistence */
-    public static final boolean MQTT_CONNECTION_STORE = false;
+    public static final boolean MQTT_CONNECTION_STORE = true;
+
+    /** HaIntegration - Home Assistant discovery, command routing */
+    public static final boolean HA_INTEGRATION = true;
 
     // ==================== TRIP ANALYTICS ====================
     
@@ -230,7 +233,7 @@ public final class DaemonLogConfig {
         || SOC_HISTORY_DATABASE || WS_STREAM_SERVER || ABRP_TELEMETRY
         || ABRP_CONFIG || SOH_ESTIMATOR || TELEMETRY_DATA_COLLECTOR
         || OVERLAY_RENDERER || TRIP_ANALYTICS || STORAGE_MANAGER
-        || MQTT_CONNECTION_MANAGER || MQTT_PUBLISHER || MQTT_CONNECTION_STORE
+        || MQTT_CONNECTION_MANAGER || MQTT_PUBLISHER || MQTT_CONNECTION_STORE || HA_INTEGRATION
         || EXTERNAL_STORAGE_CLEANER || HTTP_SERVER || SURVEILLANCE_IPC
         || ABRP_API_HANDLER || PERFORMANCE_API_HANDLER;
     
@@ -277,6 +280,7 @@ public final class DaemonLogConfig {
             if (MQTT_CONNECTION_MANAGER)    ENABLED_TAGS.add("MqttConnectionManager");
             if (MQTT_PUBLISHER)             ENABLED_TAGS.add("MqttPublisher");
             if (MQTT_CONNECTION_STORE)      ENABLED_TAGS.add("MqttConnectionStore");
+            if (HA_INTEGRATION)             ENABLED_TAGS.add("MqttHaIntegration");
             if (TRIP_ANALYTICS) {
                 ENABLED_TAGS.add("TripAnalyticsManager");
                 ENABLED_TAGS.add("TripDetector");
@@ -299,9 +303,16 @@ public final class DaemonLogConfig {
     /**
      * Check if file logging is enabled for a given tag.
      * Called by DaemonLogger on every log write.
+     *
+     * Supports prefix matching so per-instance loggers like "MqttPublisher-a3f9c2"
+     * are covered by the "MqttPublisher" entry in ENABLED_TAGS.
      */
     public static boolean isFileLoggingEnabled(String tag) {
         if (ENABLE_ALL) return true;
-        return ENABLED_TAGS.contains(tag);
+        if (ENABLED_TAGS.contains(tag)) return true;
+        for (String enabled : ENABLED_TAGS) {
+            if (tag.startsWith(enabled + "-")) return true;
+        }
+        return false;
     }
 }

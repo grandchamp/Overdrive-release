@@ -54,7 +54,7 @@ public class MqttPublisherService implements MqttCallback {
     public MqttPublisherService(MqttConnectionConfig config, String deviceId) {
         this.config = config;
         this.deviceId = deviceId;
-        this.logger = DaemonLogger.getInstance(TAG + "-" + config.id);
+        this.logger = DaemonLogger.getInstance(TAG);
         this.ha = config.homeAssistantDiscovery ? new HaIntegration(config, deviceId) : null;
     }
 
@@ -87,7 +87,7 @@ public class MqttPublisherService implements MqttCallback {
             MqttConnectOptions options = new MqttConnectOptions();
             options.setCleanSession(true);
             options.setConnectionTimeout(10);
-            options.setKeepAliveInterval(30);
+            options.setKeepAliveInterval(15);
             options.setAutomaticReconnect(false); // We handle reconnect ourselves for proxy awareness
 
             // Auth
@@ -315,6 +315,19 @@ public class MqttPublisherService implements MqttCallback {
         lastError = "Connection lost: " + (cause != null ? extractRootCause(cause) : "unknown");
         logger.warn(lastError);
         ProxyHelper.invalidateCache();
+
+        // Trigger immediate reconnect in a background thread so HA doesn't see
+        // entities as unavailable for the full publish-interval + backoff window.
+        // Without this, the publisher waits idly until the next scheduled publish()
+        // before noticing it's dead and trying to reconnect.
+        if (running) {
+            new Thread(() -> {
+                try {
+                    Thread.sleep(1000);  // brief pause to let the broker settle
+                    connect();
+                } catch (InterruptedException ignored) {}
+            }, "MQTT-Reconnect-" + config.id).start();
+        }
     }
 
     @Override

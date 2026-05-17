@@ -30,7 +30,7 @@ import java.util.Map;
  */
 class HaIntegration {
 
-    private static final String TAG = "HaIntegration";
+    private static final String TAG = "MqttHaIntegration";
 
     @FunctionalInterface
     private interface CommandHandler {
@@ -47,7 +47,7 @@ class HaIntegration {
     HaIntegration(MqttConnectionConfig config, String deviceId) {
         this.config = config;
         this.deviceId = deviceId;
-        this.logger = DaemonLogger.getInstance(TAG + "-" + config.id);
+        this.logger = DaemonLogger.getInstance(TAG);
         this.commandMap = buildCommandMap();
     }
 
@@ -73,9 +73,14 @@ class HaIntegration {
     }
 
     void onMessage(String topic, String payload) {
+        logger.info("HA: message received topic=" + topic + " payload=" + payload);
         String prefix = config.topic + "/command/";
-        if (!topic.startsWith(prefix)) return;
+        if (!topic.startsWith(prefix)) {
+            logger.warn("HA: ignoring message — topic doesn't match prefix " + prefix);
+            return;
+        }
         String suffix = topic.substring(prefix.length());
+        logger.info("HA: routing command suffix=" + suffix);
         new Thread(() -> routeCommand(suffix, payload), "HA-Cmd-" + config.id).start();
     }
 
@@ -103,6 +108,11 @@ class HaIntegration {
     // ==================== DISCOVERY ====================
 
     private void publishDiscovery(MqttClient client, boolean cloudEnabled) {
+        // Reset on each republish — the broker overwrites retained configs at the same
+        // topic names, but our local tracking list needs to reflect the current set,
+        // not the cumulative one across reconnects.
+        discoveryTopics.clear();
+
         String state = config.topic;
         String avail = config.topic + "/availability";
         String cmd   = config.topic + "/command/";
@@ -182,6 +192,9 @@ class HaIntegration {
         String topic = "homeassistant/" + component + "/" + objectId + "/config";
         discoveryTopics.add(topic);
         try {
+            // unique_id is REQUIRED by HA to associate entities with a device.
+            // Without it, entities show up unattached or get silently rejected.
+            cfg.put("unique_id", objectId);
             MqttMessage msg = new MqttMessage(cfg.toString().getBytes("UTF-8"));
             msg.setQos(1);
             msg.setRetained(true);
@@ -288,6 +301,7 @@ class HaIntegration {
         }
         try {
             handler.execute(payload);
+            logger.info("HA: command executed (" + suffix + " ← " + payload + ")");
         } catch (Exception e) {
             logger.warn("HA: command error (" + suffix + " ← " + payload + "): " + e.getMessage());
         }

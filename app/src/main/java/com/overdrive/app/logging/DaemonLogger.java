@@ -217,6 +217,16 @@ public class DaemonLogger {
         if (globalConfig.enableFileLog && DaemonLogConfig.isFileLoggingEnabled(tag)) {
             writeToFile(logLine);
         }
+
+        // Forward to in-app log panel, gated by the same DaemonLogConfig flag
+        if (DaemonLogConfig.isFileLoggingEnabled(tag)) {
+            try {
+                LogManager.LogListener listener = LogManager.Companion.getLogListener();
+                if (listener != null) {
+                    listener.onLog(tag, message, LogLevel.valueOf(level.name()));
+                }
+            } catch (Exception ignored) {}
+        }
     }
     
     /**
