@@ -347,6 +347,13 @@ public class CameraDaemon {
         ipcServer = new SurveillanceIpcServer(19877);
         accMonitor = new AccMonitor();
 
+        // Init app context. This will break the app if run in a thread
+        if (sharedAppContext == null) {
+            try {
+                sharedAppContext = createAppContext();
+            } catch (Throwable ignored) {}
+        }
+
         // Notifications subsystem — registry, push subscriptions, sinks.
         // Lives in this process because HttpServer (where the API routes bind)
         // runs here, and every v1 emit source (surveillance, proximity, tyre)
@@ -1819,7 +1826,37 @@ public class CameraDaemon {
     public static void onAccStateChanged(boolean accIsOff) {
         // Update AccMonitor state for HTTP API responses
         com.overdrive.app.monitor.AccMonitor.setAccState(!accIsOff);
-        
+
+        // CRITICAL: Capture the BydVehicleData snapshot and record the ACC
+        // transition BEFORE any pipeline/teardown work. The OFF event must
+        // be persisted before BydDataCollector.setAccState(false) (further
+        // down) zeroes out polling — otherwise the OFF row would have stale
+        // or null telemetry. For ON, the collector is being resumed, not
+        // torn down; the snapshot may be a few seconds stale, which is
+        // fine (a 3s skew is negligible vs a 12-hour park, and any latency
+        // biases the displayed delta toward zero — conservative).
+        //
+        // Wrapped in try/catch — must NEVER throw out of onAccStateChanged
+        // because that would break the daemon's state machine.
+        try {
+            com.overdrive.app.byd.BydVehicleData accSnapshot = null;
+            try {
+                com.overdrive.app.byd.BydDataCollector collector =
+                    com.overdrive.app.byd.BydDataCollector.getInstance();
+                if (collector != null && collector.isInitialized()) {
+                    accSnapshot = collector.getData();
+                }
+            } catch (Throwable t) {
+                // Collector not initialized yet on cold boot, etc. — pass
+                // null snapshot, the row will still be recorded with the
+                // event type so future correlation is possible.
+            }
+            com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                .recordAccEvent(accIsOff ? "OFF" : "ON", accSnapshot);
+        } catch (Throwable t) {
+            log("recordAccEvent failed (non-fatal): " + t.getMessage());
+        }
+
         // ALWAYS notify TripAnalyticsManager regardless of GPU pipeline state.
         // Trip detection depends on ACC events and must not be blocked by pipeline readiness.
         if (tripAnalyticsManager != null) {
@@ -2863,46 +2900,27 @@ public class CameraDaemon {
     // ==================== NOTIFICATIONS ====================
 
     /**
+     * Idempotency guard. Once the registry + sinks are wired, repeat calls
+     * are no-ops.
+     */
+    private static volatile boolean notificationsInitialized = false;
+
+    /**
      * Initialize the Web Push notification subsystem. Loads the category
      * registry from APK assets, opens persistent stores under
      * {@code /data/local/tmp/.push/}, registers PushSink + LogSink with
      * NotificationBus, and wires NotificationApiHandler so HTTP routes can
      * resolve.
-     *
-     * <p>This method short-circuits and does NOTHING if the user hasn't
-     * reserved a zrok subdomain yet — push notifications require a stable
-     * HTTPS origin to install the PWA. Without zrok, we skip:
-     * <ul>
-     *   <li>Reading {@code notifications-categories.json} from assets</li>
-     *   <li>Generating / loading the VAPID keypair</li>
-     *   <li>Reading the subscription file</li>
-     *   <li>Registering sinks (so {@link com.overdrive.app.notifications.NotificationBus}
-     *       short-circuits all publishes — emit sites pay zero cost)</li>
-     * </ul>
-     * The user can re-trigger init by reserving a zrok URL and restarting
-     * the daemon.
      */
-    private static void initNotifications() throws Exception {
-        // Cross-UID readable file — same one HttpServer.isPwaOrigin reads.
-        // PreferencesManager would NPE here because UID 2000 cannot read
-        // app-private SharedPreferences.
-        java.io.File zrokNameFile = new java.io.File("/data/local/tmp/.zrok/unique_name");
-        if (!zrokNameFile.exists() || zrokNameFile.length() == 0) {
-            log("Notifications skipped: no zrok unique_name reserved (PWA install requires stable HTTPS origin)");
-            return;
-        }
+    public static synchronized void initNotifications() throws Exception {
+        if (notificationsInitialized) return;
 
         com.overdrive.app.notifications.CategoryRegistry registry = null;
 
-        // The registry JSON ships in the APK assets. Prefer the cached
-        // sharedAppContext if already populated; fall back to creating one
-        // (createAppContext() may block up to 10s on cold daemon start).
+        // The registry JSON ships in the APK assets. Use the cached
+        // sharedAppContext if already populated; Do not create one
+        // as it breaks in a thread
         android.content.Context appContext = getAppContext();
-        if (appContext == null) {
-            try {
-                appContext = createAppContext();
-            } catch (Throwable ignored) {}
-        }
         if (appContext != null) {
             try {
                 registry = com.overdrive.app.notifications.CategoryRegistry.loadFromAssets(appContext);
@@ -2940,6 +2958,7 @@ public class CameraDaemon {
 
         com.overdrive.app.server.NotificationApiHandler.init(registry, subStore, keyStore);
 
+        notificationsInitialized = true;
         log("Notifications initialized: " + registry.all().size() + " categories, "
                 + subStore.size() + " subscriptions");
     }

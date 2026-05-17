@@ -247,22 +247,47 @@ BYD.i18n = (function () {
         }
     }
 
+    // True when the page is loaded inside the Android WebView (the app
+     // shell injects a JavascriptInterface called AndroidBridge). The locale
+     // policy differs between the two contexts:
+     //
+     //   In-app WebView   — the APP's locale is the source of truth. Any
+     //                      web-side picker change is pushed to the server
+     //                      (which writes the app-side LocaleManager); the
+     //                      server's value is also pulled in via /status so
+     //                      flipping language in the Android Settings panel
+     //                      live-syncs the WebView.
+     //   External tunnel  — the BROWSER's localStorage is the source of
+     //                      truth. The picker writes only locally; we do
+     //                      NOT post to the server (would cross-pollute
+     //                      the app's locale) and we do NOT honour
+     //                      `status.locale` overrides (that's the app's
+     //                      preference, not ours).
+     //
+     // This keeps the two locales fully separated, matching the design
+     // already in place for the theme picker.
+    function inAppWebView() {
+        return typeof window !== 'undefined' && typeof window.AndroidBridge !== 'undefined';
+    }
+
     /**
-     * Switch active language. Persists choice locally + posts to server so
-     * Java-side error JSON comes back in the matching locale on the next fetch.
-     * Resolves once the new catalog is loaded and the DOM has been rehydrated.
+     * Switch active language. Persists choice locally — and, ONLY when
+     * running inside the Android WebView, posts to the server so the
+     * app-side LocaleManager picks up the change too. External browsers
+     * stay self-contained: their picker doesn't reach into the app.
      */
     function setLang(lang) {
         var resolved = resolveLang(lang);
         if (resolved === state.lang && state.loaded) return Promise.resolve();
         state.lang = resolved;
         setStored(resolved);
-        // Server is best-effort — UI shouldn't block on it.
-        try { fetch('/api/i18n/lang', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ lang: resolved })
-        }); } catch (e) {}
+        if (inAppWebView()) {
+            try { fetch('/api/i18n/lang', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lang: resolved })
+            }); } catch (e) {}
+        }
         return fetchCatalog(resolved).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
@@ -272,16 +297,37 @@ BYD.i18n = (function () {
     }
 
     /**
-     * Bootstrap: pick the active language from (in priority order)
-     *   1. Persisted localStorage choice
-     *   2. Server-supplied locale on /status (set via picker on another device)
-     *   3. navigator.language
-     *   4. 'en'
-     * Returns a promise; pages should `await BYD.i18n.init()` before showing UI.
+     * Returns true if the live `status.locale` from the server should
+     * override the locally-chosen language. In-app WebView: yes (app is
+     * the source of truth). External tunnel/browser: no (web picker is
+     * the source of truth). Exposed via the public API so core.js's
+     * /status handler can decide whether to call setLang().
+     */
+    function shouldFollowServerLocale() {
+        return inAppWebView();
+    }
+
+    /**
+     * Bootstrap. Pick order depends on context:
+     *   In-app WebView  — AndroidBridge.getAppLocale() (sync, always fresh)
+     *                     → localStorage → navigator.language → 'en'
+     *   External        — localStorage → navigator.language → 'en'
+     * The localStorage step second-place in app context is a transition
+     * fallback for users who picked a language on the web before this
+     * separation existed; once the app pushes a locale, that wins.
      */
     function init() {
         if (state.loadingPromise) return state.loadingPromise;
-        var picked = getStored() || detectFromBrowser();
+        var picked = null;
+        if (inAppWebView()) {
+            try {
+                if (typeof window.AndroidBridge.getAppLocale === 'function') {
+                    var fromApp = window.AndroidBridge.getAppLocale();
+                    if (fromApp) picked = fromApp;
+                }
+            } catch (e) { /* fall through to localStorage */ }
+        }
+        if (!picked) picked = getStored() || detectFromBrowser();
         state.lang = resolveLang(picked);
         state.loadingPromise = fetchCatalog(state.lang).then(function (cat) {
             state.catalog = cat || {};
@@ -302,6 +348,10 @@ BYD.i18n = (function () {
         getLang: function () { return state.lang; },
         getDisplayName: function (lang) { return DISPLAY_NAMES[lang] || lang; },
         supported: function () { return SUPPORTED.slice(); },
+        // True when the app's server-side locale should override the local
+        // pick — i.e. inside the Android WebView. The /status poll uses
+        // this to avoid clobbering a tunnel user's web-only choice.
+        shouldFollowServerLocale: shouldFollowServerLocale,
         // For tests / picker UI
         _resolve: resolveLang
     };
@@ -360,6 +410,17 @@ BYD.core = {
     deviceId: null,
     pollInterval: null,
     lastStatus: null,
+    // Counts /status fetch failures (network error, non-2xx, JSON parse).
+    // Drives the UI "stale" / "disconnected" indicators and a sooner retry,
+    // so a brief tunnel/Wi-Fi blip doesn't blank the dashboard for 5 s.
+    pollFailureCount: 0,
+    // Whether we've ever received a populated vehicle-data status. Used to
+    // decide between "Waiting for vehicle…" (first load, binders not bound
+    // yet) and last-known-good (we had data, transient error since).
+    hasEverHadVehicleData: false,
+    POLL_INTERVAL_OK_MS: 5000,
+    POLL_INTERVAL_RETRY_MS: 1500,
+    POLL_STALE_AFTER_FAILURES: 2,
 
     /**
      * Initialize core module
@@ -389,31 +450,80 @@ BYD.core = {
     },
 
     /**
-     * Start status polling
+     * Start status polling.
+     *
+     * Adaptive cadence: 5 s on success, 1.5 s while failing. Self-rescheduling
+     * (no fixed setInterval) so the next tick always reflects the current
+     * health — without this, a single long-fail period would still hold the
+     * UI in "stale" for the full 5 s after recovery.
      */
     startStatusPolling() {
-        this.refreshStatus();
-        this.pollInterval = setInterval(() => this.refreshStatus(), 5000);
+        var self = this;
+        function tick() {
+            self.refreshStatus().then(function (ok) {
+                var delay = ok ? self.POLL_INTERVAL_OK_MS : self.POLL_INTERVAL_RETRY_MS;
+                self.pollInterval = setTimeout(tick, delay);
+            });
+        }
+        tick();
     },
 
     /**
-     * Refresh status from server (consolidated - includes GPS)
+     * Refresh status from server (consolidated — includes GPS, vehicle data, etc).
+     *
+     * Resilience contract:
+     *   - On HTTP 401: redirect to /login.html (JWT expired or never set).
+     *   - On network/parse error: keep previously-rendered values, increment
+     *     failure counter, and let startStatusPolling() retry sooner. We do
+     *     NOT reset cards to "--" on a single bad poll — that's what made
+     *     the dashboard look broken on tunnel hiccups.
+     *   - On success but vehicleDataReady=false: show "Waiting for vehicle…"
+     *     in the EV card on first load; keep last-known after that.
+     *
+     * @returns {Promise<Object|null>} the parsed status object on success
+     *          (truthy → OK, used by tick() and update-flow's drift watch),
+     *          or null on failure.
      */
     async refreshStatus() {
         try {
             const res = await fetch('/status');
+            // 401 means JWT is missing/expired/invalid — bounce to login so
+            // the user lands on a screen that actually does something. The
+            // global fetch wrapper in auth.js attaches Authorization but does
+            // NOT redirect on 401; we handle it here for /status specifically.
+            if (res.status === 401) {
+                this._showStaleBanner('disconnected');
+                const path = window.location.pathname + window.location.search;
+                window.location.href = '/login.html?redirect=' + encodeURIComponent(path);
+                return null;
+            }
+            if (!res.ok) {
+                throw new Error('HTTP ' + res.status);
+            }
             const status = await res.json();
+            this.pollFailureCount = 0;
+            this._clearStaleBanner();
             this.lastStatus = status;
+            // Track whether the server has ever delivered real vehicle data.
+            // Drives the "Waiting for vehicle…" placeholder vs. last-known
+            // behaviour on cards downstream.
+            const hadData = !!(status.soc || status.range || status.charging);
+            if (hadData) this.hasEverHadVehicleData = true;
 
             // Distance unit preference (from user setting / auto-detect)
             if (status.distanceUnit) {
                 BYD.units.mode = status.distanceUnit;
             }
 
-            // Locale sync: if Android settings changed the locale on another
-            // device (e.g. via the native settings drawer), fold that change
-            // into the WebView without a manual refresh.
-            if (status.locale && BYD.i18n && status.locale !== BYD.i18n.getLang()) {
+            // Locale sync — ONLY in the Android WebView, where the app's
+            // language picker is the source of truth. External tunnel /
+            // browser users keep their own web-only locale; we must not
+            // clobber their pick with the app's server-side LocaleManager
+            // value (which is what status.locale carries).
+            if (status.locale && BYD.i18n
+                    && BYD.i18n.shouldFollowServerLocale
+                    && BYD.i18n.shouldFollowServerLocale()
+                    && status.locale !== BYD.i18n.getLang()) {
                 BYD.i18n.setLang(status.locale);
             }
 
@@ -480,11 +590,85 @@ BYD.core = {
 
             return status;
         } catch (e) {
-            console.error('[Core] Status refresh error:', e);
-            // Remove connected indicator on error
-            const connDot = document.getElementById('connDot');
-            if (connDot) connDot.classList.remove('connected');
+            this.pollFailureCount++;
+            console.warn('[Core] Status refresh failed (' + this.pollFailureCount + '): ' + e);
+            // Don't blank the dashboard on a single hiccup — keep the last
+            // good values rendered. After a couple of consecutive failures,
+            // surface a clear "Disconnected" indicator so the user knows the
+            // numbers on screen are no longer fresh.
+            if (this.pollFailureCount >= this.POLL_STALE_AFTER_FAILURES) {
+                const connDot = document.getElementById('connDot');
+                if (connDot) connDot.classList.remove('connected');
+                this._showStaleBanner(this.pollFailureCount > 4 ? 'disconnected' : 'stale');
+            }
             return null;
+        }
+    },
+
+    /**
+     * Show a small connection-state pill near the sidebar status card.
+     * Created lazily so pages without the sidebar (e.g. login) cost nothing.
+     * The pill replaces the deviceId text on the device row when stale —
+     * keeps the existing two-column status-row layout intact and stays
+     * clear of the data-i18n hydration path on the label.
+     */
+    _showStaleBanner(state) {
+        var deviceEl = document.getElementById('deviceId');
+        if (!deviceEl) return;
+        // Stash the real device id so we can restore it on recovery.
+        if (deviceEl.dataset.realText === undefined) {
+            deviceEl.dataset.realText = deviceEl.textContent;
+        }
+        var pill = document.getElementById('connStatePill');
+        if (!pill) {
+            pill = document.createElement('span');
+            pill.id = 'connStatePill';
+            // Tight pill sized to fit the .status-value column even on
+            // narrow sidebars. Long translations (e.g. Norwegian
+            // "Frakoblet") clip with ellipsis rather than push the row out
+            // of the card.
+            pill.style.cssText = 'padding:2px 6px;border-radius:10px;' +
+                'font-size:10px;font-weight:600;letter-spacing:.3px;' +
+                'text-transform:uppercase;max-width:100%;display:inline-block;' +
+                'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+                'vertical-align:middle;';
+            deviceEl.textContent = '';
+            deviceEl.appendChild(pill);
+        }
+        // i18n.t() returns null while the catalog is still loading and the
+        // raw key (e.g. "status.disconnected") when loaded but the key is
+        // missing in the active locale. Treat both as "fall back to the
+        // English label" so the user never sees a dotted-namespace string.
+        var i18nLookup = function (key, fallback) {
+            if (!window.BYD || !BYD.i18n) return fallback;
+            var v = BYD.i18n.t(key);
+            return (v && v !== key) ? v : fallback;
+        };
+        if (state === 'disconnected') {
+            pill.textContent = i18nLookup('status.disconnected', 'Disconnected');
+            pill.style.background = 'rgba(239,68,68,0.18)';
+            pill.style.color = '#ef4444';
+        } else {
+            pill.textContent = i18nLookup('status.stale', 'Stale');
+            pill.style.background = 'rgba(251,191,36,0.18)';
+            pill.style.color = '#f59e0b';
+        }
+        pill.style.display = '';
+    },
+
+    _clearStaleBanner() {
+        var pill = document.getElementById('connStatePill');
+        if (!pill) return;
+        // Restore the real device id text so the row reads normally again.
+        var deviceEl = document.getElementById('deviceId');
+        if (deviceEl) {
+            var real = deviceEl.dataset.realText;
+            deviceEl.removeAttribute('data-real-text');
+            // The next /status tick will overwrite this with the live id;
+            // we only need to make the pill go away cleanly.
+            deviceEl.textContent = real != null ? real : (this.deviceId || '');
+        } else {
+            pill.parentNode && pill.parentNode.removeChild(pill);
         }
     },
 
@@ -506,6 +690,28 @@ BYD.core = {
         const evBatteryFill = document.getElementById('evBatteryFill');
         const evChargeFlow = document.getElementById('evChargeFlow');
         const evRange = document.getElementById('evRange');
+
+        // First-load placeholder: server says vehicle data isn't ready yet
+        // (BYD binders still binding, ACC just came on, etc.). Show an
+        // explicit "Waiting for vehicle…" instead of the silent "--%" that
+        // looked like the app was simply broken.
+        if (soc === null && status.vehicleDataReady === false && !this.hasEverHadVehicleData) {
+            if (evPercentValue) {
+                evPercentValue.textContent = (BYD.i18n && BYD.i18n.t('status.waiting_vehicle')) || 'Waiting…';
+                evPercentValue.style.fontSize = '11px';
+                evPercentValue.style.fontWeight = '600';
+                evPercentValue.style.letterSpacing = '.3px';
+            }
+            if (evRange) evRange.textContent = '—';
+            return;
+        }
+        // We've had real data at some point, or are getting it now — restore
+        // the percentage formatting to its default look.
+        if (evPercentValue && evPercentValue.style.fontSize) {
+            evPercentValue.style.fontSize = '';
+            evPercentValue.style.fontWeight = '';
+            evPercentValue.style.letterSpacing = '';
+        }
 
         if (soc !== null) {
             const socRounded = Math.round(soc);

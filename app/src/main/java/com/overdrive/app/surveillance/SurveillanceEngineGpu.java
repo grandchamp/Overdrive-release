@@ -2516,7 +2516,6 @@ public class SurveillanceEngineGpu {
         // reasoning.
         int persons = 0, vehicles = 0, bikes = 0, animals = 0;
         Actor.Proximity closest = null;
-        String camHint = null;
         String detectionLabel = "motion";
         Actor threat = null;
         for (Actor a : snap) {
@@ -2530,9 +2529,6 @@ public class SurveillanceEngineGpu {
             }
             if (closest == null || a.peakProximity.ordinal() < closest.ordinal()) {
                 closest = a.peakProximity;
-                if (a.peakCamera >= 0 && a.peakCamera < MotionPipelineV2.QUADRANT_NAMES.length) {
-                    camHint = MotionPipelineV2.QUADRANT_NAMES[a.peakCamera];
-                }
             }
             if (threat == null
                     || a.peakSeverity.ordinal() > threat.peakSeverity.ordinal()
@@ -2541,8 +2537,17 @@ public class SurveillanceEngineGpu {
                 threat = a;
             }
         }
+        // camHint follows the threat actor so the title's "X at <camera>" phrase
+        // names the camera that saw X, not whichever actor happened to be closest.
+        String camHint = cameraNameFor(threat);
         float bestConf = threat != null ? threat.peakConfidence : 0f;
         if (threat != null) detectionLabel = Actor.groupLabel(threat.classGroup);
+        // Telegram tier mute — mirrors the push tier toggles so a
+        // Telegram-only user can keep CRITICAL/ALERT and silence NOTICE.
+        if (!com.overdrive.app.notifications.NotificationGate.shouldTelegram(peakSev, config)) {
+            logger.debug("Telegram start-stage suppressed by per-tier toggle (sev=" + peakSev + ")");
+            return;
+        }
         try {
             TelegramNotifier.notifyMotion(
                     detectionLabel,
@@ -2570,7 +2575,7 @@ public class SurveillanceEngineGpu {
         Actor.Severity peakSev = com.overdrive.app.notifications.NotificationGate.maxSeverity(snap);
         int persons = 0, vehicles = 0, bikes = 0, animals = 0;
         Actor.Proximity closest = null;
-        String camHint = null;
+        Actor threat = null;
         for (Actor a : snap) {
             if (a.isStatic) continue;
             switch (a.classGroup) {
@@ -2582,10 +2587,21 @@ public class SurveillanceEngineGpu {
             }
             if (closest == null || a.peakProximity.ordinal() < closest.ordinal()) {
                 closest = a.peakProximity;
-                if (a.peakCamera >= 0 && a.peakCamera < MotionPipelineV2.QUADRANT_NAMES.length) {
-                    camHint = MotionPipelineV2.QUADRANT_NAMES[a.peakCamera];
-                }
             }
+            if (threat == null
+                    || a.peakSeverity.ordinal() > threat.peakSeverity.ordinal()
+                    || (a.peakSeverity == threat.peakSeverity
+                        && classRank(a.classGroup) > classRank(threat.classGroup))) {
+                threat = a;
+            }
+        }
+        // camHint follows the threat actor — see sendRichMotionNotifications.
+        String camHint = cameraNameFor(threat);
+        // Telegram tier mute — same gate as the start-stage notification so
+        // both stages of the two-stage flow honour the same toggle.
+        if (!com.overdrive.app.notifications.NotificationGate.shouldTelegram(peakSev, config)) {
+            logger.debug("Telegram final-stage suppressed by per-tier toggle (sev=" + peakSev + ")");
+            return;
         }
         try {
             TelegramNotifier.notifyMotionFinalized(
@@ -2616,6 +2632,12 @@ public class SurveillanceEngineGpu {
         }
     }
 
+    private static String cameraNameFor(Actor a) {
+        if (a == null) return null;
+        if (a.peakCamera < 0 || a.peakCamera >= MotionPipelineV2.QUADRANT_NAMES.length) return null;
+        return MotionPipelineV2.QUADRANT_NAMES[a.peakCamera];
+    }
+
     /**
      * Stable per-event tag used by both the initial quick notification and the
      * finalized rich one. Same tag → OS replaces the first banner with the
@@ -2630,6 +2652,69 @@ public class SurveillanceEngineGpu {
         // Fallback when we don't yet have a filename — minute-bucket dedupe
         // (matches legacy behaviour).
         return "motion-" + (System.currentTimeMillis() / 60000L);
+    }
+
+    /**
+     * Fallback hero JPEG: extract a keyframe from the MP4 itself when
+     * ThumbnailBuffer didn't capture one. Saves to the same path
+     * `<videoBase>.jpg` so the rest of the pipeline (sidecar reference,
+     * Telegram sendPhoto, PWA push image) works unchanged. Atomic write
+     * via .tmp + rename, world-readable so the Telegram daemon (different
+     * UID) can read it.
+     *
+     * Idempotent and exception-safe — failure is logged but never thrown
+     * to the caller. The notification path treats absence of the file as
+     * "text-only", which is the correct degraded behaviour.
+     */
+    private void writeFallbackHeroFromMp4(File mp4File, File outFile) {
+        if (mp4File == null || outFile == null) return;
+        if (outFile.exists()) return;          // ThumbnailBuffer already wrote one
+        if (!mp4File.exists() || mp4File.length() == 0) return;
+
+        android.media.MediaMetadataRetriever mmr = null;
+        try {
+            mmr = new android.media.MediaMetadataRetriever();
+            mmr.setDataSource(mp4File.getAbsolutePath());
+            // Sample at ~1s in (or 0 if the clip is shorter) to skip the
+            // black frame the encoder sometimes leads with.
+            String dur = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION);
+            long durMs = 0;
+            try { if (dur != null) durMs = Long.parseLong(dur); } catch (Exception ignored) {}
+            long sampleUs = durMs >= 1500 ? 1_000_000L : Math.max(0L, (durMs * 500L));
+            android.graphics.Bitmap frame = mmr.getFrameAtTime(sampleUs,
+                    android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if (frame == null) {
+                frame = mmr.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            }
+            if (frame == null) {
+                logger.debug("Fallback hero: getFrameAtTime returned null for " + mp4File.getName());
+                return;
+            }
+            File tmpFile = new File(outFile.getAbsolutePath() + ".tmp");
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile)) {
+                frame.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, fos);
+                try { fos.getFD().sync(); } catch (Throwable ignored) {}
+            } finally {
+                frame.recycle();
+            }
+            try { tmpFile.setReadable(true, /*ownerOnly=*/false); } catch (Throwable ignored) {}
+            if (!tmpFile.renameTo(outFile)) {
+                outFile.delete();
+                if (!tmpFile.renameTo(outFile)) {
+                    tmpFile.delete();
+                    logger.warn("Fallback hero rename failed for " + outFile.getName());
+                    return;
+                }
+            }
+            logger.info("Fallback hero (from mp4 keyframe): " + outFile.getName());
+        } catch (Throwable t) {
+            logger.debug("Fallback hero extraction failed for " + mp4File.getName()
+                    + ": " + t.getMessage());
+        } finally {
+            if (mmr != null) {
+                try { mmr.release(); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     /**
@@ -2756,7 +2841,6 @@ public class SurveillanceEngineGpu {
             // camera" — not "1 person, 2 vehicles".
             int persons = 0, vehicles = 0, bikes = 0, animals = 0;
             Actor.Proximity closest = null;
-            String camHint = null;
             // Threat actor = highest-severity, then best class rank
             // (person > bike > vehicle > animal).
             Actor threat = null;
@@ -2771,9 +2855,6 @@ public class SurveillanceEngineGpu {
                 }
                 if (closest == null || a.peakProximity.ordinal() < closest.ordinal()) {
                     closest = a.peakProximity;
-                    if (a.peakCamera >= 0 && a.peakCamera < MotionPipelineV2.QUADRANT_NAMES.length) {
-                        camHint = MotionPipelineV2.QUADRANT_NAMES[a.peakCamera];
-                    }
                 }
                 if (threat == null
                         || a.peakSeverity.ordinal() > threat.peakSeverity.ordinal()
@@ -2782,6 +2863,9 @@ public class SurveillanceEngineGpu {
                     threat = a;
                 }
             }
+            // camHint follows the threat actor so the title's "X at <camera>"
+            // phrase names the camera that saw X, not whichever actor was closest.
+            String camHint = cameraNameFor(threat);
 
             // ---- Title (severity tier + threat class + camera) ----
             // Format: "CRITICAL · Person at front" or "Alert · Vehicle at rear"
@@ -2805,9 +2889,12 @@ public class SurveillanceEngineGpu {
             // ---- Body (proximity phrase + counts when relevant) ----
             // Single actor: "Very close" / "Close" / "Mid range" / "Far".
             // Multiple actors: "Very close · 1 person, 2 vehicles".
-            // Drops the awkward "1× person, closest very close" phrasing.
+            // When a hero JPEG was written, append "close-up view" so the user
+            // knows the attached image is the foveated crop around the threat,
+            // not a wide shot of the camera frame.
             String body;
             int totalActors = persons + vehicles + bikes + animals;
+            boolean hasHero = heroJpegName != null && !heroJpegName.isEmpty();
             if (threat == null) {
                 body = "Recording in progress";
             } else {
@@ -2820,6 +2907,7 @@ public class SurveillanceEngineGpu {
                     sb.append(formatActorCounts(persons, vehicles, bikes, animals));
                 }
                 if (sb.length() == 0) sb.append("Motion detected");
+                if (hasHero) sb.append(" · close-up view");
                 body = sb.toString();
             }
 
@@ -3056,6 +3144,18 @@ public class SurveillanceEngineGpu {
             String videoName = currentEventFile.getName();
             String heroSibling = videoName.replace(".mp4", ".jpg");
             File heroSiblingFile = new File(currentEventFile.getParentFile(), heroSibling);
+
+            // If ThumbnailBuffer didn't write a YOLO-derived hero (no actor
+            // ever classified during this event — e.g. very short motion-only
+            // clips, or every actor was filtered out as static-NOTICE
+            // background) fall back to a single keyframe extracted from the
+            // recorded MP4 so Telegram and the PWA push always have an image
+            // to show. Without this, the user gets a text-only "Motion
+            // detected" alert with no preview, which looks broken.
+            if (!heroSiblingFile.exists()) {
+                writeFallbackHeroFromMp4(currentEventFile, heroSiblingFile);
+            }
+
             String heroName = heroSiblingFile.exists() ? heroSibling : null;
             String heroPath = heroSiblingFile.exists() ? heroSiblingFile.getAbsolutePath() : null;
             try { publishMotionFinal(videoName, heroName); }
