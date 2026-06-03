@@ -1422,6 +1422,20 @@ public class GpuSurveillancePipeline {
      * @param prefix Filename prefix (e.g., "cam", "proximity", "event")
      */
     public void startRecording(java.io.File outputDir, String prefix) {
+        // DIAG (Finding A): log the exact recorder/encoder/format state on
+        // every start request so a silent no-op explains itself in the field
+        // log. If this line is ABSENT from a drive's log right after "Starting
+        // DRIVE_MODE recording", the running daemon is NOT this build.
+        {
+            boolean recReady = recorder != null;
+            boolean encReady = recReady && recorder.getEncoder() != null;
+            boolean fmtReady = encReady && recorder.getEncoder().isFormatAvailable();
+            logger.info("startRecording(prefix=" + prefix + ", dir="
+                + (outputDir != null ? outputDir.getName() : "default")
+                + "): recorder=" + recReady + " encoder=" + encReady
+                + " formatAvailable=" + fmtReady + " currentMode=" + currentMode);
+        }
+
         // Stop surveillance if active (mutually exclusive)
         if (currentMode == Mode.SURVEILLANCE) {
             logger.info("Stopping surveillance to start normal recording (mutually exclusive)");
@@ -1445,14 +1459,53 @@ public class GpuSurveillancePipeline {
         if (recorder != null) {
             // Check if encoder is ready (has received at least one frame from camera).
             if (recorder.getEncoder() != null && recorder.getEncoder().isFormatAvailable()) {
-                recorder.startRecording(outputDir, prefix);
-                currentMode = Mode.NORMAL_RECORDING;
-                recorder.setOverlayRecordingModeAllowed(true);
-                if (telemetryCollector != null) {
-                    telemetryCollector.setOverlayRecordingActive(true);
-                    telemetryCollector.startPolling();
+                // Pre-flight write probe (timeout-bounded). On a half-mounted USB
+                // at cold start the deeper start path (ensureRecordingsSpace scan
+                // / new MediaMuxer open) can BLOCK INDEFINITELY with no return —
+                // which hangs this thread and defeats the isRecording()-based
+                // retry below (it never runs). Probing first lets us fail fast
+                // and defer + retry instead of hanging.
+                java.io.File probeDir = (outputDir != null) ? outputDir
+                        : StorageManager.getInstance().getRecordingsDir();
+                if (!isStorageWriteReady(probeDir)) {
+                    logger.warn("Recordings volume not write-ready (probe failed/timed out) — "
+                        + "deferring and scheduling retry");
+                    pendingRecordingDir = outputDir;
+                    pendingRecordingPrefix = prefix;
+                    recordingMode = true;
+                    scheduleStorageReadyRetry(outputDir, prefix);
+                    return;
                 }
-                logger.info("Normal recording started (dir=" + (outputDir != null ? outputDir.getName() : "default") + ", prefix=" + prefix + ")");
+                recorder.startRecording(outputDir, prefix);
+                if (recorder.isRecording()) {
+                    currentMode = Mode.NORMAL_RECORDING;
+                    recordingMode = true;
+                    recorder.setOverlayRecordingModeAllowed(true);
+                    if (telemetryCollector != null) {
+                        telemetryCollector.setOverlayRecordingActive(true);
+                        telemetryCollector.startPolling();
+                    }
+                    cancelStorageReadyRetry();
+                    logger.info("Normal recording started (dir=" + (outputDir != null ? outputDir.getName() : "default") + ", prefix=" + prefix + ")");
+                } else {
+                    // recorder.startRecording() returned WITHOUT starting — the
+                    // encoder's triggerEventRecording() failed, in the field
+                    // almost always because the USB volume was not write-ready
+                    // at this instant. This is the cold-start race: the daemon
+                    // boots straight into gear D and asks to record before the
+                    // USB has finished mounting, so mkdirs() on the recordings
+                    // dir fails ("Failed to create parent directory" /
+                    // "No writable USB drive found") and the WHOLE drive then
+                    // records nothing because the old code (a) logged a false
+                    // "Normal recording started" and (b) never retried.
+                    // Defer + retry until storage settles.
+                    logger.warn("Recording did not start — storage not write-ready "
+                        + "(USB still mounting?); deferring and scheduling retry");
+                    pendingRecordingDir = outputDir;
+                    pendingRecordingPrefix = prefix;
+                    recordingMode = true;
+                    scheduleStorageReadyRetry(outputDir, prefix);
+                }
             } else {
                 // Encoder not ready yet (camera still warming up). Store the
                 // request and register a one-shot listener that fires the
@@ -1479,9 +1532,24 @@ public class GpuSurveillancePipeline {
                     });
                 }
             }
+        } else {
+            // recorder == null: the GpuMosaicRecorder is created asynchronously
+            // on the GL thread by start(); a DRIVE_MODE/CONTINUOUS activation
+            // that reaches startRecording() before that completes would
+            // otherwise fall through this whole method and silently no-op —
+            // the daemon logs "Starting DRIVE_MODE recording" but no cam_*.mp4
+            // is ever written for the drive (Finding A: "no recordings while
+            // driving"). Defer instead: capture the intent so the
+            // format-available listener / checkPendingRecording() starts
+            // recording once the recorder + encoder are ready.
+            logger.info("Recorder not created yet — deferring recording start "
+                + "(will begin when pipeline is ready)");
+            pendingRecordingDir = outputDir;
+            pendingRecordingPrefix = prefix;
+            recordingMode = true;
         }
     }
-    
+
     /**
      * Called when the encoder format becomes available (probe complete, first frame encoded).
      * Starts any pending recording that was deferred because the encoder wasn't ready.
@@ -1498,14 +1566,162 @@ public class GpuSurveillancePipeline {
         
         logger.info("Encoder now ready — starting deferred recording");
         recorder.startRecording(dir, prefix);
-        currentMode = Mode.NORMAL_RECORDING;
-        recorder.setOverlayRecordingModeAllowed(true);
-        if (telemetryCollector != null) {
-            telemetryCollector.setOverlayRecordingActive(true);
-            telemetryCollector.startPolling();
+        if (recorder.isRecording()) {
+            currentMode = Mode.NORMAL_RECORDING;
+            recordingMode = true;
+            recorder.setOverlayRecordingModeAllowed(true);
+            if (telemetryCollector != null) {
+                telemetryCollector.setOverlayRecordingActive(true);
+                telemetryCollector.startPolling();
+            }
+            cancelStorageReadyRetry();
+            logger.info("Deferred normal recording started (dir=" +
+                (dir != null ? dir.getName() : "default") + ", prefix=" + prefix + ")");
+        } else {
+            // Encoder ready but storage still not write-ready (cold-start USB
+            // mount race). Re-defer and retry until the volume settles, rather
+            // than silently dropping the whole drive's recording.
+            logger.warn("Deferred start: storage not write-ready yet — scheduling retry");
+            pendingRecordingDir = dir;
+            pendingRecordingPrefix = prefix;
+            recordingMode = true;
+            scheduleStorageReadyRetry(dir, prefix);
         }
-        logger.info("Deferred normal recording started (dir=" + 
-            (dir != null ? dir.getName() : "default") + ", prefix=" + prefix + ")");
+    }
+
+    // --- Cold-start storage-ready retry -----------------------------------
+    // The daemon can boot straight into gear D and request a DRIVE_MODE /
+    // CONTINUOUS recording before the USB volume has finished mounting. The
+    // encoder's MediaMuxer/mkdirs then fails on the not-yet-writable volume
+    // ("Failed to create parent directory" / "No writable USB drive found"),
+    // and historically the entire drive recorded nothing because the start
+    // path logged a false success and never retried. This bounded background
+    // retry re-attempts the start once the volume becomes write-ready, then
+    // exits. It is cancelled by a successful start or by stopRecording()
+    // (e.g. gear D->P), so it can never resurrect a recording after the driver
+    // has parked.
+    private volatile Thread storageRetryThread;
+    private static final long STORAGE_RETRY_INTERVAL_MS = 2000L;
+    private static final long STORAGE_RETRY_TIMEOUT_MS = 60_000L;
+    private static final long STORAGE_PROBE_TIMEOUT_MS = 1500L;
+
+    private synchronized void scheduleStorageReadyRetry(java.io.File outputDir, String prefix) {
+        if (storageRetryThread != null && storageRetryThread.isAlive()) {
+            return;  // a retry is already in flight
+        }
+        storageRetryThread = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + STORAGE_RETRY_TIMEOUT_MS;
+            int attempt = 0;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(STORAGE_RETRY_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;  // cancelled (stopRecording / success)
+                }
+                // Bail if the request was cancelled (gear change) or already
+                // satisfied by another path.
+                if (pendingRecordingPrefix == null && !recordingMode) return;
+                if (recorder != null && recorder.isRecording()) return;
+                attempt++;
+                try {
+                    // Re-resolve/mount storage, then re-attempt — but ONLY once a
+                    // timeout-bounded write probe confirms the volume is actually
+                    // writable, so a retry attempt can never itself hang inside
+                    // the blocking start path on a still-half-mounted USB.
+                    StorageManager.getInstance().ensureStorageReady(false);
+                    java.io.File probeDir = (outputDir != null) ? outputDir
+                            : StorageManager.getInstance().getRecordingsDir();
+                    if (recorder != null && recorder.getEncoder() != null
+                            && recorder.getEncoder().isFormatAvailable()
+                            && isStorageWriteReady(probeDir)) {
+                        recorder.startRecording(outputDir, prefix);
+                        if (recorder.isRecording()) {
+                            currentMode = Mode.NORMAL_RECORDING;
+                            recordingMode = true;
+                            recorder.setOverlayRecordingModeAllowed(true);
+                            if (telemetryCollector != null) {
+                                telemetryCollector.setOverlayRecordingActive(true);
+                                telemetryCollector.startPolling();
+                            }
+                            pendingRecordingDir = null;
+                            pendingRecordingPrefix = null;
+                            logger.info("Normal recording started on storage retry #" + attempt
+                                + " (dir=" + (outputDir != null ? outputDir.getName() : "default")
+                                + ", prefix=" + prefix + ")");
+                            return;
+                        }
+                    }
+                    logger.info("Storage-ready retry #" + attempt
+                        + ": still not write-ready, will retry");
+                } catch (Exception e) {
+                    logger.warn("Storage-ready retry #" + attempt + " error: " + e.getMessage());
+                }
+            }
+            logger.warn("Storage-ready retry gave up after "
+                + (STORAGE_RETRY_TIMEOUT_MS / 1000) + "s — USB never became write-ready");
+        }, "RecStorageRetry");
+        storageRetryThread.setDaemon(true);
+        storageRetryThread.start();
+    }
+
+    private synchronized void cancelStorageReadyRetry() {
+        Thread t = storageRetryThread;
+        if (t != null) {
+            t.interrupt();
+            storageRetryThread = null;
+        }
+    }
+
+    /**
+     * Timeout-bounded write probe for the target recordings volume. Creates the
+     * dir if needed, then writes + deletes a tiny temp file on a worker thread
+     * joined with a short timeout.
+     *
+     * <p>Returns false if the volume can't be written OR — the key case — the
+     * probe doesn't finish in time. On a half-mounted USB at cold start,
+     * filesystem ops (mkdirs / ensureRecordingsSpace's scan / {@code new
+     * MediaMuxer()}'s open) can block indefinitely with no return, which would
+     * otherwise hang the recording-start thread and defeat the retry above (the
+     * isRecording() check never runs). Gating the real start on this cheap probe
+     * turns that indefinite hang into a fast, recoverable "not ready → retry".
+     * The probe thread is a daemon and holds no pipeline locks, so even if it
+     * does hang on a wedged volume it is harmless and reaped when the process or
+     * the volume recovers.
+     */
+    private boolean isStorageWriteReady(java.io.File dir) {
+        if (dir == null) return false;
+        final java.io.File target = dir;
+        final boolean[] ok = {false};
+        Thread probe = new Thread(() -> {
+            try {
+                if (!target.exists()) {
+                    target.mkdirs();
+                }
+                if (!target.isDirectory()) return;
+                java.io.File t = new java.io.File(target,
+                    ".wrprobe_" + android.os.Process.myPid());
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(t);
+                try {
+                    fos.write(0);
+                    fos.flush();
+                } finally {
+                    try { fos.close(); } catch (Exception ignored) {}
+                }
+                t.delete();
+                ok[0] = true;
+            } catch (Throwable ignored) {
+                // ok stays false — volume not write-ready
+            }
+        }, "RecWriteProbe");
+        probe.setDaemon(true);
+        probe.start();
+        try {
+            probe.join(STORAGE_PROBE_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return ok[0];  // false if the probe timed out (still running) or failed
     }
     
     /**
@@ -1520,7 +1736,8 @@ public class GpuSurveillancePipeline {
         pendingRecordingDir = null;
         pendingRecordingPrefix = null;
         recordingMode = false;
-        
+        cancelStorageReadyRetry();
+
         if (recorder != null) {
             recorder.stopRecording();
             

@@ -247,6 +247,10 @@ public class CameraDaemon {
         }
     }
     
+    // Build stamp printed at startup so logs identify the running build.
+    // BUMP THIS on every code change you intend to deploy + verify.
+    private static final String BUILD_TAG = "20260603-coldstart-recfix-1";
+
     // Lock file for singleton enforcement
     private static final String LOCK_FILE = "/data/local/tmp/camera_daemon.lock";
     private static java.io.RandomAccessFile lockFile;
@@ -281,6 +285,11 @@ public class CameraDaemon {
         com.overdrive.app.storage.StorageManager.enableDaemonLogging();
 
         log("=== CAMERA DAEMON STARTING ===");
+        // Build stamp — bump BUILD_TAG on every change so the field log
+        // unambiguously identifies which build is actually running. (Deploys
+        // via `adb install -r` do NOT restart the in-memory daemon; this line
+        // makes it trivial to confirm a restart actually loaded new code.)
+        log("BUILD_TAG: " + BUILD_TAG);
         log("PID: " + android.os.Process.myPid() + ", UID: " + android.os.Process.myUid());
 
         // Grant all manifest permissions via shell (supplements PermissionBypassContext)

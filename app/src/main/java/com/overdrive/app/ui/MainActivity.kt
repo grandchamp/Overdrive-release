@@ -556,17 +556,14 @@ class MainActivity : AppCompatActivity() {
      * Schedule periodic update checks (every 6 hours).
      */
     private fun schedulePeriodicUpdateCheck() {
-        val sixHoursMs = 6 * 60 * 60 * 1000L
-        // Cancel any prior runnable (e.g. across activity recreate).
+        // AUTO-UPDATE DISABLED — the periodic 6h check called checkForAppUpdate()
+        // which can downloadAndInstall a newer release and silently overwrite a
+        // locally-patched build. Turned off so the device stays on the build you
+        // flashed. Manual updates still work (Settings → About → Check for
+        // updates / invokeCheckForUpdates()). To restore auto-update, revert
+        // this method to the periodic postDelayed scheduling.
         updateCheckRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = object : Runnable {
-            override fun run() {
-                checkForAppUpdate()
-                mainHandler.postDelayed(this, sixHoursMs)
-            }
-        }
-        updateCheckRunnable = runnable
-        mainHandler.postDelayed(runnable, sixHoursMs)
+        updateCheckRunnable = null
     }
 
     private fun performAppUpdate(updater: com.overdrive.app.updater.AppUpdater) {

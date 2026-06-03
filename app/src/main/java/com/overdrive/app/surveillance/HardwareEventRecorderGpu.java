@@ -907,6 +907,21 @@ public class HardwareEventRecorderGpu {
     // holds startStopLock) and producing a near-empty middle segment with
     // bad PTS bookkeeping (firstFramePtsUs == -1 fallback).
     private static final long ROTATE_DEBOUNCE_MS = 1000L;
+    // Max wall-clock the segment rotation will spend writing the queued backlog
+    // into the OLD (about-to-be-finalized) muxer before giving up and dropping
+    // the remainder. This drain (in rotateSegmentLocked) runs on the DRAINER
+    // thread under muxerLock and does blocking writeSampleData calls; if a
+    // stalled USB/SD write makes them block, the drainer stops dequeuing the
+    // encoder, the encoder input Surface fills, the GL thread blocks in
+    // eglSwapBuffers, and the 3s GL watchdog (PanoramicCameraGpu
+    // GL_THREAD_TIMEOUT_MS) force-restarts the process — truncating the clip
+    // and leaving a .broken stub (the field-observed "records then stops after
+    // a few seconds while driving"). Capping the drain far below the 3s
+    // watchdog turns a storage stall into a sub-second gap at the 2-minute
+    // segment seam instead of a process kill. Healthy rotations drain a handful
+    // of frames in well under 1 ms, so this budget is never reached in normal
+    // operation.
+    private static final long ROTATE_DRAIN_BUDGET_MS = 200L;
     // CAS gate shared by every rotateSegment() caller (natural drainer tick +
     // forceSegmentRotation HTTP path). Whoever flips false→true does the
     // rotation; concurrent callers observe true and bail. Reset in finally
@@ -3568,11 +3583,30 @@ public class HardwareEventRecorderGpu {
         synchronized (muxerLock) {
             // Drain remaining queue into the OLD muxer. These packets have
             // PTS values that belong to the old segment; writing them to the
-            // new muxer would break PTS monotonicity.
+            // new muxer would break PTS monotonicity, so the queue MUST be
+            // empty before the hot-swap below.
+            //
+            // BOUNDED: writing the backlog is blocking disk I/O on the drainer
+            // thread, and under storage backpressure the queue can hold up to
+            // MUXER_WRITE_QUEUE_CAPACITY packets, each writeSampleData stalling
+            // on the slow drive. Draining all of it synchronously here starves
+            // the encoder drain → GL eglSwapBuffers blocks → the 3s GL watchdog
+            // kills the process (see ROTATE_DRAIN_BUDGET_MS). So we write only
+            // until the time budget is spent, then DROP (recycle without
+            // writing) the remaining old-segment packets. Dropping — rather
+            // than leaving them queued — is mandatory: any packet left in the
+            // queue would be picked up by the disk writer AFTER the swap and
+            // written, with its old PTS, into the NEW muxer, corrupting that
+            // segment. A sub-second seam gap beats a process restart.
+            final long drainDeadlineNs =
+                System.nanoTime() + ROTATE_DRAIN_BUDGET_MS * 1_000_000L;
             MuxerPacket pkt;
             int drained = 0;
+            int dropped = 0;
+            boolean stopWriting = false;  // latches once budget spent or a write fails
             while ((pkt = muxerWriteQueue.poll()) != null) {
-                if (muxerStarted && muxer != null) {
+                if (!stopWriting && muxerStarted && muxer != null
+                        && System.nanoTime() < drainDeadlineNs) {
                     try {
                         pkt.rewindForWrite();
                         if (pkt.trackKind == TRACK_KIND_AUDIO) {
@@ -3591,14 +3625,30 @@ public class HardwareEventRecorderGpu {
                     } catch (Exception e) {
                         logger.warn("Rotation drain error: " + e.getMessage());
                         writerAbortedCorrupt = true;
+                        // Drop (don't leave queued) the rest, so nothing leaks
+                        // into the new muxer after the swap.
+                        stopWriting = true;
+                        dropped++;
                         releaseMuxerPacket(pkt);
-                        break;
+                        continue;
                     }
+                } else {
+                    // Budget exhausted (or muxer gone): latch and drop the
+                    // remaining backlog instead of stalling the drainer.
+                    stopWriting = true;
+                    dropped++;
                 }
                 releaseMuxerPacket(pkt);
             }
-            if (drained > 0) {
-                logger.debug("Rotation drained " + drained + " queued frames into old segment");
+            if (drained > 0 || dropped > 0) {
+                if (dropped > 0) {
+                    logger.warn("Rotation drained " + drained + " queued frames into old"
+                        + " segment, DROPPED " + dropped + " (drain budget "
+                        + ROTATE_DRAIN_BUDGET_MS + "ms exceeded — storage backpressure;"
+                        + " dropping seam frames to avoid a GL watchdog restart)");
+                } else {
+                    logger.debug("Rotation drained " + drained + " queued frames into old segment");
+                }
             }
 
             // Stash the old muxer + its stats so the background finalizer
